@@ -1,0 +1,6 @@
+/build/
+/ssh-wrapper
+/ssh-wrapper.exe
+/scp-wrapper
+/scp-wrapper.exe
+/ssh-wrapper.hosts.conf

@@ -1,0 +1,27 @@
+# ssh-wrapper/scp-wrapper example configuration.
+# Keep this file beside both executables and replace every change-me password.
+# This internal-tool format stores passwords as plaintext.
+
+[wrapper]
+# Usually both clients are found automatically.
+# real_ssh = "C:/Windows/System32/OpenSSH/ssh.exe"
+# real_scp = "C:/Windows/System32/OpenSSH/scp.exe"
+force_password_auth = true
+
+# Server list adapted from trps2/yangmy/registry.toml. Passwords are redacted.
+[servers]
+"1.13001" = { host = "A.B.C.D", port = 13001, user = "app", password = "change-me" }
+"2.13031" = { host = "A.B.C.D", port = 13031, user = "app", password = "change-me" }
+"3.11061" = { host = "A.B.C.D", port = 11061, user = "app", password = "change-me" }
+
+# Arbitrary OpenSSH options can be added per server. Password, HostName, Port,
+# and User must use the structured fields above.
+# For a server with several options, the expanded child-table form is clearer:
+# [servers."custom-host"]
+# host = "10.0.0.1"
+# port = 22
+# user = "app"
+# password = "change-me"
+#
+# [servers."custom-host".options]
+# StrictHostKeyChecking = "accept-new"
