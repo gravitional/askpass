@@ -1,5 +1,5 @@
-# GitLab CI for the linux-shell Runner in /data/yangmy/gitlabrunner.
-# The shell executor ignores image:, so all commands use the host Go toolchain.
+# GitLab 13.11 shell-runner pipeline. Platform packages are separate jobs so
+# each artifact stays below the server/proxy single-upload size limit.
 
 stages:
   - test
@@ -21,117 +21,113 @@ test:
   script:
     - set -euo pipefail
     - go version
-    - test "$(go env GOVERSION | sed 's/^go//')" != ""
     - test -z "$(gofmt -l .)"
     - go vet ./...
     - go test ./...
 
-package:
+.package_template:
   stage: package
   script:
     - set -euo pipefail
-    - go version
-    - rm -rf dist
-    - mkdir -p dist
+    - name="askpass-${GOOS}-${GOARCH}"
+    - pkgdir="dist/${name}"
+    - mkdir -p "$pkgdir"
+    - ext=""; if [ "$GOOS" = windows ]; then ext=".exe"; fi
     - |
-      while read -r goos goarch; do
-        [ -n "$goos" ] || continue
-        name="askpass-${goos}-${goarch}"
-        pkgdir="dist/${name}"
-        mkdir -p "$pkgdir"
-        ext=""
-        archive_ext="tar.gz"
-        if [ "$goos" = windows ]; then
-          ext=".exe"
-          archive_ext="zip"
-        fi
-
-        for binary in ssh-wrapper scp-wrapper; do
-          echo "Building ${name}/${binary}${ext}"
-          GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
-            go build -trimpath -ldflags='-s -w' \
-            -o "${pkgdir}/${binary}${ext}" .
-        done
-
-        cp ssh-wrapper-config.toml "${pkgdir}/ssh-wrapper-config.example.toml"
-        cp README.md LICENSE "${pkgdir}/"
-
-        if [ "$archive_ext" = zip ]; then
-          (cd dist && zip -qr "${name}.zip" "$name")
-        else
-          tar -czf "dist/${name}.tar.gz" -C dist "$name"
-        fi
-      done <<'TARGETS'
-      linux amd64
-      linux arm64
-      darwin amd64
-      darwin arm64
-      windows amd64
-      windows arm64
-      TARGETS
-    - (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS.txt)
-    - ls -lh dist/*
+      for binary in ssh-wrapper scp-wrapper; do
+        echo "Building ${name}/${binary}${ext}"
+        CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
+          -o "${pkgdir}/${binary}${ext}" .
+      done
+    - cp ssh-wrapper-config.toml "${pkgdir}/ssh-wrapper-config.example.toml"
+    - cp README.md LICENSE "$pkgdir/"
+    - |
+      if [ "$GOOS" = windows ]; then
+        (cd dist && zip -qr "${name}.zip" "$name")
+      else
+        tar -czf "dist/${name}.tar.gz" -C dist "$name"
+      fi
+    - archive=$(find dist -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print -quit)
+    - (cd dist && sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256")
+    - ls -lh "$archive" "${archive}.sha256"
   artifacts:
-    name: "askpass-${CI_COMMIT_REF_SLUG}"
+    name: "askpass-${GOOS}-${GOARCH}-${CI_COMMIT_REF_SLUG}"
     paths:
       - dist/*.tar.gz
       - dist/*.zip
-      - dist/SHA256SUMS.txt
+      - dist/*.sha256
     expire_in: 14 days
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v/'
     - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
     - when: never
 
+package_linux_amd64:
+  extends: .package_template
+  variables: { GOOS: linux, GOARCH: amd64 }
+
+package_linux_arm64:
+  extends: .package_template
+  variables: { GOOS: linux, GOARCH: arm64 }
+
+package_darwin_amd64:
+  extends: .package_template
+  variables: { GOOS: darwin, GOARCH: amd64 }
+
+package_darwin_arm64:
+  extends: .package_template
+  variables: { GOOS: darwin, GOARCH: arm64 }
+
+package_windows_amd64:
+  extends: .package_template
+  variables: { GOOS: windows, GOARCH: amd64 }
+
+package_windows_arm64:
+  extends: .package_template
+  variables: { GOOS: windows, GOARCH: arm64 }
+
 publish_release:
   stage: release
   dependencies:
-    - package
+    - package_linux_amd64
+    - package_linux_arm64
+    - package_darwin_amd64
+    - package_darwin_arm64
+    - package_windows_amd64
+    - package_windows_arm64
   script:
     - set -euo pipefail
+    - (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS.txt)
     - |
       package_base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/askpass/${CI_COMMIT_TAG}"
       links='[]'
-
       for archive in dist/*.tar.gz dist/*.zip dist/SHA256SUMS.txt; do
         filename=$(basename "$archive")
         url="${package_base}/${filename}"
-        echo "Uploading ${filename}"
         curl --fail --show-error --silent --retry 3 \
           --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
-          --upload-file "$archive" \
-          "$url"
-        links=$(printf '%s' "$links" | jq \
-          --arg name "$filename" \
-          --arg url "$url" \
+          --upload-file "$archive" "$url"
+        links=$(printf '%s' "$links" | jq --arg name "$filename" --arg url "$url" \
           '. + [{name: $name, url: $url}]')
       done
 
-      payload=$(jq -n \
-        --arg tag "$CI_COMMIT_TAG" \
+      payload=$(jq -n --arg tag "$CI_COMMIT_TAG" \
         --arg name "askpass ${CI_COMMIT_TAG}" \
         --arg description "Cross-platform askpass binaries built from ${CI_COMMIT_SHA}." \
         --argjson links "$links" \
         '{tag_name: $tag, name: $name, description: $description, assets: {links: $links}}')
-
       releases_url="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases"
       encoded_tag=$(printf '%s' "$CI_COMMIT_TAG" | jq -sRr @uri)
-      if curl --fail --silent \
-        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+      if curl --fail --silent --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
         "${releases_url}/${encoded_tag}" >/dev/null 2>&1; then
-        method=PUT
-        release_url="${releases_url}/${encoded_tag}"
+        method=PUT; release_url="${releases_url}/${encoded_tag}"
       else
-        method=POST
-        release_url="$releases_url"
+        method=POST; release_url="$releases_url"
       fi
-
-      curl --fail --show-error --silent \
-        --request "$method" \
+      curl --fail --show-error --silent --request "$method" \
         --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
         --header 'Content-Type: application/json' \
-        --data "$payload" \
-        "$release_url"
+        --data "$payload" "$release_url"
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v/'
     - when: never
