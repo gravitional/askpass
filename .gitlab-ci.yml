@@ -1,5 +1,5 @@
-# GitLab 13.11 shell-runner pipeline. Platform packages are separate jobs so
-# each artifact stays below the server/proxy single-upload size limit.
+# GitLab 13.11 shell-runner pipeline. This instance's Job Artifacts upload
+# endpoint is broken, so tagged packages go directly to Generic Packages.
 
 stages:
   - test
@@ -50,13 +50,15 @@ test:
     - archive=$(find dist -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print -quit)
     - (cd dist && sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256")
     - ls -lh "$archive" "${archive}.sha256"
-  artifacts:
-    name: "askpass-${GOOS}-${GOARCH}-${CI_COMMIT_REF_SLUG}"
-    paths:
-      - dist/*.tar.gz
-      - dist/*.zip
-      - dist/*.sha256
-    expire_in: 14 days
+    - |
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        package_base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/askpass/${CI_COMMIT_TAG}"
+        for file in "$archive" "${archive}.sha256"; do
+          curl --fail --show-error --silent --retry 3 \
+            --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+            --upload-file "$file" "${package_base}/$(basename "$file")"
+        done
+      fi
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v/'
     - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
@@ -88,25 +90,31 @@ package_windows_arm64:
 
 publish_release:
   stage: release
-  dependencies:
-    - package_linux_amd64
-    - package_linux_arm64
-    - package_darwin_amd64
-    - package_darwin_arm64
-    - package_windows_amd64
-    - package_windows_arm64
   script:
     - set -euo pipefail
-    - (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS.txt)
+    - mkdir -p dist
     - |
       package_base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/askpass/${CI_COMMIT_TAG}"
+      for filename in \
+        askpass-linux-amd64.tar.gz \
+        askpass-linux-arm64.tar.gz \
+        askpass-darwin-amd64.tar.gz \
+        askpass-darwin-arm64.tar.gz \
+        askpass-windows-amd64.zip \
+        askpass-windows-arm64.zip; do
+        curl --fail --show-error --silent --retry 3 \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --output "dist/${filename}" "${package_base}/${filename}"
+      done
+      (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS.txt)
+      curl --fail --show-error --silent --retry 3 \
+        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        --upload-file dist/SHA256SUMS.txt "${package_base}/SHA256SUMS.txt"
+
       links='[]'
       for archive in dist/*.tar.gz dist/*.zip dist/SHA256SUMS.txt; do
         filename=$(basename "$archive")
         url="${package_base}/${filename}"
-        curl --fail --show-error --silent --retry 3 \
-          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
-          --upload-file "$archive" "$url"
         links=$(printf '%s' "$links" | jq --arg name "$filename" --arg url "$url" \
           '. + [{name: $name, url: $url}]')
       done
