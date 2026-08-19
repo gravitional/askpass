@@ -4,11 +4,13 @@
 stages:
   - test
   - package
+  - release
 
 variables:
   CGO_ENABLED: "0"
   GOCACHE: "$CI_PROJECT_DIR/.ci-cache/go-build"
   GOMODCACHE: "/data/yangmy/gitlabrunner/cache/go-mod"
+  PATH: "/data/yangmy/local/go/bin:/data/cmbin:/home/app/environment/anaconda3/bin:/usr/local/bin:/usr/bin:/bin"
 
 default:
   tags:
@@ -79,4 +81,57 @@ package:
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v/'
     - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+    - when: never
+
+publish_release:
+  stage: release
+  dependencies:
+    - package
+  script:
+    - set -euo pipefail
+    - |
+      package_base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/askpass/${CI_COMMIT_TAG}"
+      links='[]'
+
+      for archive in dist/*.tar.gz dist/*.zip dist/SHA256SUMS.txt; do
+        filename=$(basename "$archive")
+        url="${package_base}/${filename}"
+        echo "Uploading ${filename}"
+        curl --fail --show-error --silent --retry 3 \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --upload-file "$archive" \
+          "$url"
+        links=$(printf '%s' "$links" | jq \
+          --arg name "$filename" \
+          --arg url "$url" \
+          '. + [{name: $name, url: $url}]')
+      done
+
+      payload=$(jq -n \
+        --arg tag "$CI_COMMIT_TAG" \
+        --arg name "askpass ${CI_COMMIT_TAG}" \
+        --arg description "Cross-platform askpass binaries built from ${CI_COMMIT_SHA}." \
+        --argjson links "$links" \
+        '{tag_name: $tag, name: $name, description: $description, assets: {links: $links}}')
+
+      releases_url="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases"
+      encoded_tag=$(printf '%s' "$CI_COMMIT_TAG" | jq -sRr @uri)
+      if curl --fail --silent \
+        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        "${releases_url}/${encoded_tag}" >/dev/null 2>&1; then
+        method=PUT
+        release_url="${releases_url}/${encoded_tag}"
+      else
+        method=POST
+        release_url="$releases_url"
+      fi
+
+      curl --fail --show-error --silent \
+        --request "$method" \
+        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        --header 'Content-Type: application/json' \
+        --data "$payload" \
+        "$release_url"
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
     - when: never
