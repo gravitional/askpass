@@ -1,0 +1,122 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test ./...
+
+  build:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 同一份源码按可执行文件名分别生成 ssh-wrapper 和 scp-wrapper。
+      - name: Build ssh-wrapper / scp-wrapper
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          pkgdir="dist/askpass-${GOOS}-${GOARCH}"
+          mkdir -p "$pkgdir"
+          ext=""
+          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+          for name in ssh-wrapper scp-wrapper; do
+            echo "Building $pkgdir/${name}${ext}"
+            go build -trimpath -ldflags='-s -w' -o "$pkgdir/${name}${ext}" .
+          done
+          # 示例配置使用 .example 后缀发布，避免解压时覆盖用户已部署的真实密码配置。
+          cp ssh-wrapper-config.toml "$pkgdir/ssh-wrapper-config.example.toml"
+          cp README.md LICENSE "$pkgdir/"
+          ls -l "$pkgdir"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          cd dist
+          name="askpass-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip -r "${name}.zip" "$name"
+          else
+            tar -czf "${name}.tar.gz" "$name"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: askpass-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/askpass-${{ matrix.goos }}-${{ matrix.goarch }}.*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          generate_release_notes: true
+          files: release/*
