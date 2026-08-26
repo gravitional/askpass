@@ -6,15 +6,22 @@ stages:
   - package
   - release
 
+# 这里只放与机器无关的东西。PATH / GOCACHE / GOMODCACHE 每台 runner 都不一样,
+# 放在各自 config.toml 的 [[runners]] environment 里 —— 仓库不该知道某台机器的
+# 目录长什么样。job variables 会覆盖 runner environment, 所以这几项一旦写回这里,
+# 换 runner 就废了 (2026-08-26 从 .15 迁到 .12 时踩的)。
+#
+# 原来的 GOCACHE 指在 $CI_PROJECT_DIR/.ci-cache 下, 而 shell runner 每个 job 前
+# 会 git clean -ffdx —— 那份缓存其实每次都被清掉, 从来没起过作用。挪到 runner
+# 配置里之后才真正跨 job 复用。
 variables:
   CGO_ENABLED: "0"
-  GOCACHE: "$CI_PROJECT_DIR/.ci-cache/go-build"
-  GOMODCACHE: "/data/yangmy/gitlabrunner/cache/go-mod"
-  PATH: "/data/yangmy/local/go/bin:/data/cmbin:/home/app/environment/anaconda3/bin:/usr/local/bin:/usr/bin:/bin"
 
 default:
   tags:
-    - linux-shell
+    # tps-centos8-12-shell @ 10.0.255.12 (/home/ymy/gitlabrunner)。
+    # 换 runner 时改这一行 + 那台机器的 config.toml, 别把路径写回上面。
+    - linux-shell-12
 
 test:
   stage: test
