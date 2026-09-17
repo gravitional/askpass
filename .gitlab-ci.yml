@@ -126,23 +126,67 @@ publish_release:
           '. + [{name: $name, url: $url}]')
       done
 
-      payload=$(jq -n --arg tag "$CI_COMMIT_TAG" \
+      releases_url="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases"
+      encoded_tag=$(printf '%s' "$CI_COMMIT_TAG" | jq -sRr @uri)
+
+      # CI_JOB_TOKEN may CREATE a release but not update one -- GitLab answers
+      # 403 on PUT. Setting a RELEASE_TOKEN CI variable (a project or personal
+      # access token with api scope) lifts that restriction; without one, a
+      # re-run over an existing tag just leaves the release alone.
+      if [ -n "${RELEASE_TOKEN:-}" ]; then
+        auth="PRIVATE-TOKEN: ${RELEASE_TOKEN}"
+      else
+        auth="JOB-TOKEN: ${CI_JOB_TOKEN}"
+      fi
+
+      create_payload=$(jq -n --arg tag "$CI_COMMIT_TAG" \
         --arg name "askpass ${CI_COMMIT_TAG}" \
         --arg description "Cross-platform askpass binaries built from ${CI_COMMIT_SHA}." \
         --argjson links "$links" \
         '{tag_name: $tag, name: $name, description: $description, assets: {links: $links}}')
-      releases_url="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases"
-      encoded_tag=$(printf '%s' "$CI_COMMIT_TAG" | jq -sRr @uri)
-      if curl --fail --silent --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
-        "${releases_url}/${encoded_tag}" >/dev/null 2>&1; then
-        method=PUT; release_url="${releases_url}/${encoded_tag}"
-      else
-        method=POST; release_url="$releases_url"
-      fi
-      curl --fail --show-error --silent --request "$method" \
-        --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
-        --header 'Content-Type: application/json' \
-        --data "$payload" "$release_url"
+
+      status=$(curl --silent --output /tmp/release-response.json --write-out '%{http_code}' \
+        --request POST --header "$auth" --header 'Content-Type: application/json' \
+        --data "$create_payload" "$releases_url")
+
+      case "$status" in
+        20*)
+          echo "Created release ${CI_COMMIT_TAG}."
+          ;;
+        409)
+          # Already released once; re-running the pipeline for this tag.
+          # PUT accepts only name/description -- tag_name and assets are
+          # rejected there, and the asset links are keyed on the tag anyway so
+          # they stay valid without being resent.
+          update_payload=$(jq -n --arg name "askpass ${CI_COMMIT_TAG}" \
+            --arg description "Cross-platform askpass binaries built from ${CI_COMMIT_SHA}." \
+            '{name: $name, description: $description}')
+          status=$(curl --silent --output /tmp/release-response.json --write-out '%{http_code}' \
+            --request PUT --header "$auth" --header 'Content-Type: application/json' \
+            --data "$update_payload" "${releases_url}/${encoded_tag}")
+          case "$status" in
+            20*)
+              echo "Updated existing release ${CI_COMMIT_TAG}."
+              ;;
+            403)
+              # Not a build failure: every package was published above, and the
+              # release object already exists. Only its description is stale.
+              echo "WARNING: release ${CI_COMMIT_TAG} exists and CI_JOB_TOKEN cannot update it." >&2
+              echo "WARNING: packages were published; set RELEASE_TOKEN to refresh the release itself." >&2
+              ;;
+            *)
+              echo "Updating release ${CI_COMMIT_TAG} failed with HTTP ${status}:" >&2
+              cat /tmp/release-response.json >&2; echo >&2
+              exit 1
+              ;;
+          esac
+          ;;
+        *)
+          echo "Creating release ${CI_COMMIT_TAG} failed with HTTP ${status}:" >&2
+          cat /tmp/release-response.json >&2; echo >&2
+          exit 1
+          ;;
+      esac
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v/'
     - when: never
